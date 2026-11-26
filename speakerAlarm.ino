@@ -21,6 +21,7 @@ constexpr uint16_t TONE_HZ = 440;
 constexpr uint32_t TONE_SAMPLES = SAMPLE_RATE / 2;
 constexpr size_t BUFFER_SAMPLES = 256;
 constexpr size_t MAX_ALARMS = 20;
+constexpr size_t MAX_TIMERS = 20;
 constexpr size_t AUDIO_UPLOAD_RESERVE_BYTES = 4096;
 constexpr char TIME_ZONE[] = "PST8PDT,M3.2.0/2,M11.1.0/2";
 
@@ -71,7 +72,23 @@ struct AlarmStorage {
   uint32_t nextId;
   Alarm alarms[MAX_ALARMS];
 };
+struct Timer {
+  char name[32];
+  uint32_t durationSeconds;
+  uint32_t remainingSeconds;
+  uint32_t deadlineMillis;
+  uint8_t volume;
+  uint8_t running;
+  uint32_t id;
+};
+struct TimerStorage {
+  uint8_t version;
+  uint8_t count;
+  uint32_t nextId;
+  Timer timers[MAX_TIMERS];
+};
 AlarmStorage alarmStorage = {};
+TimerStorage timerStorage = {};
 int lastFiredDay[MAX_ALARMS] = {};
 bool preferencesReady = false;
 bool clockReady = false;
@@ -91,6 +108,7 @@ bool audioUploadStarted = false;
 bool audioUploadComplete = false;
 bool audioUploadFailed = false;
 uint32_t audioUploadId = 0;
+bool audioUploadIsTimer = false;
 size_t audioUploadBytes = 0;
 int audioUploadStatus = 400;
 String audioUploadError;
@@ -147,16 +165,20 @@ const char PAGE[] PROGMEM = R"rawliteral(
     .actions { display:flex; align-items:center; gap:.9rem; }
     .theme-control { display:flex; align-items:center; gap:.5rem; }
     #clockStatus,.muted { color:var(--muted); }
-    #alarmList { display:grid; grid-template-columns:1fr; gap:.75rem; }
-    .alarm { background:var(--card); border:1px solid var(--line); border-radius:.7rem; overflow:hidden; }
-    .alarm summary { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:1rem; cursor:pointer; list-style:none; }
-    .alarm summary::-webkit-details-marker { display:none; }
-    .alarm summary::after { content:""; width:.55rem; height:.55rem; border-right:2px solid var(--muted); border-bottom:2px solid var(--muted); transform:rotate(45deg); transition:transform .15s; flex:none; margin-right:.25rem; }
-    .alarm[open] summary::after { transform:rotate(225deg); }
-    .alarm-summary-main { display:grid; gap:.2rem; }
-    .alarm h2 { margin:0; font-size:1.1rem; }
-    .alarm-time { font-size:1.6rem; font-variant-numeric:tabular-nums; }
-    .alarm-info { color:var(--muted); font-size:.9rem; }
+    #alarmList,#timerList { display:grid; grid-template-columns:1fr; gap:.75rem; }
+    .section-heading { display:flex; align-items:center; justify-content:space-between; gap:1rem; margin:1.5rem 0 .75rem; }
+    .section-heading h2 { margin:0; font-size:1.25rem; }
+    .alarm,.timer { background:var(--card); border:1px solid var(--line); border-radius:.7rem; overflow:hidden; }
+    .alarm summary,.timer summary { display:flex; align-items:center; justify-content:space-between; gap:1rem; padding:1rem; cursor:pointer; list-style:none; }
+    .timer-summary-actions { display:flex; align-items:center; gap:.4rem; flex-wrap:wrap; justify-content:flex-end; }
+    .timer-summary-actions button { padding:.45rem .55rem; font-size:.85rem; }
+    .alarm summary::-webkit-details-marker,.timer summary::-webkit-details-marker { display:none; }
+    .alarm summary::after,.timer summary::after { content:""; width:.55rem; height:.55rem; border-right:2px solid var(--muted); border-bottom:2px solid var(--muted); transform:rotate(45deg); transition:transform .15s; flex:none; margin-right:.25rem; }
+    .alarm[open] summary::after,.timer[open] summary::after { transform:rotate(225deg); }
+    .alarm-summary-main,.timer-summary-main { display:grid; gap:.2rem; }
+    .alarm h2,.timer h2 { margin:0; font-size:1.1rem; }
+    .alarm-time,.timer-time { font-size:1.6rem; font-variant-numeric:tabular-nums; }
+    .alarm-info,.timer-info { color:var(--muted); font-size:.9rem; }
     dialog { width:min(30rem,calc(100% - 2rem)); border:1px solid var(--line); border-radius:.8rem; background:var(--card); color:var(--text); }
     dialog::backdrop { background:#0008; }
     form { display:grid; gap:1rem; }
@@ -174,10 +196,13 @@ const char PAGE[] PROGMEM = R"rawliteral(
     .toggle-switch input:checked + .switch-track { background:var(--control-accent); }
     .toggle-switch input:checked + .switch-track::before { transform:translateX(1.15rem); }
     .toggle-switch input:focus-visible + .switch-track { outline:2px solid var(--control-accent); outline-offset:2px; }
-    .alarm-editor { display:grid; gap:1rem; padding:1rem; border-top:1px solid var(--line); }
-    .alarm-editor > label { display:grid; gap:.35rem; }
+    .alarm-editor,.timer-editor { display:grid; gap:1rem; padding:1rem; border-top:1px solid var(--line); }
+    .alarm-editor > label,.timer-editor > label { display:grid; gap:.35rem; }
     .volume-line { display:flex; align-items:center; gap:.7rem; }
     .volume-line input { flex:1; accent-color:var(--control-accent); }
+    .timer-duration-fields { display:grid; grid-template-columns:repeat(3,1fr); gap:.6rem; }
+    .timer-duration-fields label { display:grid; gap:.25rem; color:var(--muted); font-size:.85rem; }
+    .timer-duration-fields input { width:100%; padding:.55rem; border:1px solid var(--line); border-radius:.4rem; background:var(--bg); color:var(--text); }
     .audio-controls { display:grid; justify-items:start; gap:.4rem; }
     .form-actions { display:flex; justify-content:flex-end; gap:.5rem; }
     #formError { color:#c22; margin:0; }
@@ -199,6 +224,11 @@ const char PAGE[] PROGMEM = R"rawliteral(
   </header>
   <p id="clockStatus" role="status">Checking clock...</p>
   <section id="alarmList" aria-live="polite"></section>
+  <div class="section-heading">
+    <h2>Timers</h2>
+    <button id="addTimer" class="primary" type="button">Add timer</button>
+  </div>
+  <section id="timerList" aria-live="polite"></section>
   <dialog id="alarmDialog">
     <form id="alarmForm">
       <h2>Add alarm</h2>
@@ -224,15 +254,38 @@ const char PAGE[] PROGMEM = R"rawliteral(
       </div>
     </form>
   </dialog>
+  <dialog id="timerDialog">
+    <form id="timerForm">
+      <h2>Add timer</h2>
+      <label>Name <input name="name" type="text" maxlength="31" required></label>
+      <div>Duration
+        <div class="timer-duration-fields">
+          <label><span>Hours</span><input name="hours" type="number" min="0" max="24" value="0" required></label>
+          <label><span>Minutes</span><input name="minutes" type="number" min="0" max="59" value="5" required></label>
+          <label><span>Seconds</span><input name="seconds" type="number" min="0" max="59" value="0" required></label>
+        </div>
+      </div>
+      <label>Volume <span><input name="volume" type="range" min="1" max="100" value="70"> <output id="timerVolumeValue">70%</output></span></label>
+      <p id="timerFormError" role="alert"></p>
+      <div class="form-actions">
+        <button id="cancelTimer" type="button">Cancel</button>
+        <button class="primary" type="submit">Save timer</button>
+      </div>
+    </form>
+  </dialog>
   <script>
     const root = document.documentElement;
     const list = document.getElementById('alarmList');
     const dialog = document.getElementById('alarmDialog');
     const form = document.getElementById('alarmForm');
+    const timerList = document.getElementById('timerList');
+    const timerDialog = document.getElementById('timerDialog');
+    const timerForm = document.getElementById('timerForm');
     const clockStatus = document.getElementById('clockStatus');
     const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
     const themeSwitch = document.getElementById('darkMode');
     let openAlarmId = null;
+    let openTimerId = null;
 
     function setTheme(dark) {
       root.dataset.theme = dark ? 'dark' : 'light';
@@ -250,6 +303,19 @@ const char PAGE[] PROGMEM = R"rawliteral(
     document.getElementById('cancelAlarm').addEventListener('click', () => dialog.close());
     form.elements.volume.addEventListener('input', event => {
       document.getElementById('volumeValue').textContent = event.target.value + '%';
+    });
+    document.getElementById('addTimer').addEventListener('click', () => {
+      timerForm.reset();
+      timerForm.elements.hours.value = '0';
+      timerForm.elements.minutes.value = '5';
+      timerForm.elements.seconds.value = '0';
+      document.getElementById('timerVolumeValue').textContent = '70%';
+      document.getElementById('timerFormError').textContent = '';
+      timerDialog.showModal();
+    });
+    document.getElementById('cancelTimer').addEventListener('click', () => timerDialog.close());
+    timerForm.elements.volume.addEventListener('input', event => {
+      document.getElementById('timerVolumeValue').textContent = event.target.value + '%';
     });
 
     function makeDayToggle(day, checked) {
@@ -276,6 +342,46 @@ const char PAGE[] PROGMEM = R"rawliteral(
       const label = document.createElement('label');
       label.append(document.createTextNode(title), control);
       formElement.appendChild(label);
+    }
+
+    function formatDurationParts(value) {
+      const parts = value.split(':').map(Number);
+      return {
+        hours: parts[0] || 0,
+        minutes: parts[1] || 0,
+        seconds: parts[2] || 0
+      };
+    }
+
+    function makeDurationFields(value) {
+      const parts = formatDurationParts(value);
+      const container = document.createElement('div');
+      container.className = 'timer-duration-fields';
+      const fields = {};
+      [['hours','Hours',24,parts.hours], ['minutes','Minutes',59,parts.minutes], ['seconds','Seconds',59,parts.seconds]]
+        .forEach(([name, title, max, initial]) => {
+          const label = document.createElement('label');
+          const text = document.createElement('span');
+          text.textContent = title;
+          const input = document.createElement('input');
+          input.type = 'number';
+          input.name = name;
+          input.min = '0';
+          input.max = String(max);
+          input.value = String(initial);
+          input.required = true;
+          fields[name] = input;
+          label.append(text, input);
+          container.appendChild(label);
+        });
+      return { container, fields };
+    }
+
+    function durationValue(fields) {
+      const pad = value => String(value).padStart(2, '0');
+      return pad(fields.hours.value) + ':' +
+        pad(fields.minutes.value) + ':' +
+        pad(fields.seconds.value);
     }
 
     function fillPayload(targetForm, payload) {
@@ -313,6 +419,263 @@ const char PAGE[] PROGMEM = R"rawliteral(
       } finally {
         button.disabled = false;
       }
+    }
+
+    async function timerAction(timer, action) {
+      const payload = new URLSearchParams();
+      payload.set('action', action);
+      const response = await fetch('/api/timers?id=' + timer.id, {
+        method: 'PUT',
+        body: payload
+      });
+      if (!response.ok) throw new Error(await response.text());
+      await loadTimers();
+    }
+
+    async function uploadTimerAudio(timer, input, button, status, onUploaded) {
+      const file = input.files[0];
+      if (!file) {
+        status.textContent = 'Choose a WAV file first.';
+        return;
+      }
+      button.disabled = true;
+      try {
+        if (!file.name.toLowerCase().endsWith('.wav')) {
+          throw new Error('Choose a WAV file (.wav).');
+        }
+        status.textContent = 'Uploading WAV file...';
+        const audio = new FormData();
+        audio.append('audio', file, file.name);
+        const response = await fetch('/api/audio?type=timer&id=' + encodeURIComponent(timer.id), {
+          method: 'POST',
+          body: audio
+        });
+        if (!response.ok) throw new Error(await response.text());
+        status.textContent = 'WAV file uploaded. It will play when the timer finishes.';
+        input.value = '';
+        onUploaded();
+      } catch (error) {
+        status.textContent = 'WAV upload failed: ' + error.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function loadTimers(requestedOpenId) {
+      if (requestedOpenId === undefined) {
+        const currentlyOpen = timerList.querySelector('.timer[open]');
+        requestedOpenId = currentlyOpen ? Number(currentlyOpen.dataset.id) : openTimerId;
+      }
+      const response = await fetch('/api/timers');
+      if (!response.ok) throw new Error(await response.text());
+      const data = await response.json();
+      timerList.replaceChildren();
+      if (!data.timers.length) {
+        const empty = document.createElement('p');
+        empty.className = 'muted';
+        empty.textContent = 'No timers yet.';
+        timerList.appendChild(empty);
+        return;
+      }
+      data.timers.forEach(timer => {
+        const card = document.createElement('details');
+        card.className = 'timer';
+        card.dataset.id = timer.id;
+        card.open = timer.id === requestedOpenId;
+        if (card.open) openTimerId = timer.id;
+        const summary = document.createElement('summary');
+        const summaryMain = document.createElement('span');
+        summaryMain.className = 'timer-summary-main';
+        const name = document.createElement('h2');
+        name.textContent = timer.name;
+        const time = document.createElement('div');
+        time.className = 'timer-time';
+        time.textContent = timer.remaining;
+        const remainingParts = timer.remaining.split(':').map(Number);
+        time.dataset.remaining = String(
+          remainingParts[0] * 3600 + remainingParts[1] * 60 + remainingParts[2]
+        );
+        time.dataset.running = timer.running ? 'true' : 'false';
+        const info = document.createElement('div');
+        info.className = 'timer-info';
+        info.textContent = timer.running
+          ? 'Running · Volume ' + timer.volume + '%'
+          : 'Stopped · Volume ' + timer.volume + '%';
+        summaryMain.append(name, time, info);
+        const summaryActions = document.createElement('span');
+        summaryActions.className = 'timer-summary-actions';
+        const summaryRemove = document.createElement('button');
+        summaryRemove.type = 'button';
+        summaryRemove.textContent = 'Delete';
+        summaryRemove.addEventListener('click', async event => {
+          event.stopPropagation();
+          if (!window.confirm('Delete timer "' + timer.name + '"?')) return;
+          try {
+            const result = await fetch('/api/timers?id=' + timer.id, { method: 'DELETE' });
+            if (!result.ok) throw new Error(await result.text());
+            openTimerId = null;
+            await loadTimers(null);
+          } catch (actionError) {
+            clockStatus.textContent = 'Timer action failed: ' + actionError.message;
+          }
+        });
+        const summaryReset = document.createElement('button');
+        summaryReset.type = 'button';
+        summaryReset.textContent = 'Reset';
+        summaryReset.addEventListener('click', async event => {
+          event.stopPropagation();
+          try { await timerAction(timer, 'reset'); }
+          catch (actionError) { clockStatus.textContent = 'Timer action failed: ' + actionError.message; }
+        });
+        const summaryToggle = document.createElement('button');
+        summaryToggle.type = 'button';
+        summaryToggle.textContent = timer.running ? 'Pause' : 'Start';
+        summaryToggle.addEventListener('click', async event => {
+          event.stopPropagation();
+          try { await timerAction(timer, timer.running ? 'pause' : 'start'); }
+          catch (actionError) { clockStatus.textContent = 'Timer action failed: ' + actionError.message; }
+        });
+        summaryActions.append(summaryRemove, summaryReset, summaryToggle);
+        summary.append(summaryMain, summaryActions);
+        summary.addEventListener('click', event => {
+          if (event.target.closest('button')) return;
+          openTimerId = card.open ? null : timer.id;
+        });
+
+        const editor = document.createElement('form');
+        editor.className = 'timer-editor';
+        const nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.name = 'name';
+        nameInput.maxLength = 31;
+        nameInput.required = true;
+        nameInput.value = timer.name;
+        addField(editor, 'Name', nameInput);
+        const duration = makeDurationFields(timer.duration);
+        addField(editor, 'Duration', duration.container);
+        const volumeInput = document.createElement('input');
+        volumeInput.type = 'range';
+        volumeInput.name = 'volume';
+        volumeInput.min = '1';
+        volumeInput.max = '100';
+        volumeInput.value = timer.volume;
+        const volumeOutput = document.createElement('output');
+        volumeOutput.textContent = timer.volume + '%';
+        const volumeLine = document.createElement('span');
+        volumeLine.className = 'volume-line';
+        volumeLine.append(volumeInput, volumeOutput);
+        addField(editor, 'Volume', volumeLine);
+        volumeInput.addEventListener('input', () => {
+          volumeOutput.textContent = volumeInput.value + '%';
+        });
+        const audioInput = document.createElement('input');
+        audioInput.type = 'file';
+        audioInput.accept = '.wav,audio/wav,audio/x-wav';
+        addField(editor, 'Timer sound (WAV)', audioInput);
+        const audioStatus = document.createElement('p');
+        audioStatus.className = 'timer-info';
+        audioStatus.textContent = timer.hasAudio
+          ? 'WAV already uploaded. It will play when the timer finishes; choose another WAV to replace it.'
+          : 'No WAV file uploaded; the default beep will play.';
+        const uploadButton = document.createElement('button');
+        uploadButton.type = 'button';
+        uploadButton.textContent = 'Upload WAV';
+        uploadButton.disabled = true;
+        audioInput.addEventListener('change', () => {
+          uploadButton.disabled = !audioInput.files.length;
+        });
+        uploadButton.addEventListener('click', () => {
+          uploadTimerAudio(timer, audioInput, uploadButton, audioStatus, () => {
+            timer.hasAudio = true;
+          });
+        });
+        const audioControls = document.createElement('div');
+        audioControls.className = 'audio-controls';
+        audioControls.append(uploadButton, audioStatus);
+        editor.appendChild(audioControls);
+
+        const error = document.createElement('p');
+        error.className = 'edit-error';
+        error.setAttribute('role', 'alert');
+        const actions = document.createElement('div');
+        actions.className = 'form-actions';
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = 'Delete';
+        remove.addEventListener('click', async () => {
+          if (!window.confirm('Delete timer "' + timer.name + '"?')) return;
+          try {
+            const result = await fetch('/api/timers?id=' + timer.id, { method: 'DELETE' });
+            if (!result.ok) throw new Error(await result.text());
+            openTimerId = null;
+            await loadTimers(null);
+          } catch (deleteError) {
+            error.textContent = deleteError.message;
+          }
+        });
+        const reset = document.createElement('button');
+        reset.type = 'button';
+        reset.textContent = 'Reset';
+        reset.addEventListener('click', async () => {
+          try { await timerAction(timer, 'reset'); }
+          catch (actionError) { error.textContent = actionError.message; }
+        });
+        const toggle = document.createElement('button');
+        toggle.type = 'button';
+        toggle.textContent = timer.running ? 'Pause' : 'Start';
+        toggle.addEventListener('click', async () => {
+          try { await timerAction(timer, timer.running ? 'pause' : 'start'); }
+          catch (actionError) { error.textContent = actionError.message; }
+        });
+        const save = document.createElement('button');
+        save.type = 'submit';
+        save.className = 'primary';
+        save.textContent = 'Save changes';
+        actions.append(remove, reset, toggle, save);
+        editor.append(error, actions);
+
+        const hasChanges = () =>
+          nameInput.value !== timer.name ||
+          durationValue(duration.fields) !== timer.duration ||
+          Number(volumeInput.value) !== timer.volume;
+        const updateActionLabel = () => {
+          const changed = hasChanges();
+          save.textContent = changed ? 'Save changes' : 'Cancel';
+          save.classList.toggle('primary', changed);
+        };
+        editor.addEventListener('input', updateActionLabel);
+        editor.addEventListener('change', updateActionLabel);
+        updateActionLabel();
+        editor.addEventListener('submit', async event => {
+          event.preventDefault();
+          if (!hasChanges()) {
+            card.open = false;
+            openTimerId = null;
+            return;
+          }
+          const payload = new URLSearchParams();
+          payload.set('name', nameInput.value);
+          payload.set('duration', durationValue(duration.fields));
+          payload.set('volume', volumeInput.value);
+          save.disabled = true;
+          error.textContent = '';
+          try {
+            const result = await fetch('/api/timers?id=' + timer.id, {
+              method: 'PUT',
+              body: payload
+            });
+            if (!result.ok) throw new Error(await result.text());
+            openTimerId = null;
+            await loadTimers(null);
+          } catch (saveError) {
+            error.textContent = saveError.message;
+          } finally {
+            save.disabled = false;
+          }
+        });
+        card.append(summary, editor);
+        timerList.appendChild(card);
+      });
     }
 
     async function loadAlarms(requestedOpenId) {
@@ -515,11 +878,55 @@ const char PAGE[] PROGMEM = R"rawliteral(
       }
     });
 
+    timerForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const payload = new URLSearchParams();
+      payload.set('name', timerForm.elements.name.value);
+      const timerDuration =
+        String(timerForm.elements.hours.value).padStart(2, '0') + ':' +
+        String(timerForm.elements.minutes.value).padStart(2, '0') + ':' +
+        String(timerForm.elements.seconds.value).padStart(2, '0');
+      payload.set('duration', timerDuration);
+      payload.set('volume', timerForm.elements.volume.value);
+      const error = document.getElementById('timerFormError');
+      error.textContent = '';
+      try {
+        const response = await fetch('/api/timers', { method: 'POST', body: payload });
+        if (!response.ok) throw new Error(await response.text());
+        const created = await response.json();
+        timerDialog.close();
+        openTimerId = created.id;
+        await loadTimers(created.id);
+      } catch (saveError) {
+        error.textContent = saveError.message;
+      }
+    });
+
     loadAlarms().catch(error => { clockStatus.textContent = 'Could not load alarms: ' + error.message; });
+    loadTimers().catch(error => { clockStatus.textContent += ' Could not load timers: ' + error.message; });
     setInterval(() => {
-      if (dialog.open || list.querySelector('.alarm[open]')) return;
+      timerList.querySelectorAll('.timer-time').forEach(time => {
+        if (time.dataset.running !== 'true') return;
+        let remaining = Math.max(0, Number(time.dataset.remaining) - 1);
+        time.dataset.remaining = String(remaining);
+        const hours = Math.floor(remaining / 3600);
+        const minutes = Math.floor((remaining % 3600) / 60);
+        const seconds = remaining % 60;
+        time.textContent =
+          String(hours).padStart(2, '0') + ':' +
+          String(minutes).padStart(2, '0') + ':' +
+          String(seconds).padStart(2, '0');
+      });
+    }, 1000);
+    setInterval(() => {
+      if (dialog.open || timerDialog.open ||
+          list.querySelector('.alarm[open]') ||
+          timerList.querySelector('.timer[open]')) return;
       loadAlarms().catch(error => {
         clockStatus.textContent = 'Could not refresh alarms: ' + error.message;
+      });
+      loadTimers().catch(error => {
+        clockStatus.textContent += ' Could not refresh timers: ' + error.message;
       });
     }, 30000);
   </script>
@@ -640,29 +1047,27 @@ bool readWavInfo(File &file, WavInfo &info) {
          info.dataBytes % info.blockAlign == 0;
 }
 
-bool playAlarmAudio(const Alarm &alarm) {
+bool playStoredAudio(const char *path, uint8_t volume, const char *label) {
   if (!fileSystemReady) {
     return false;
   }
-  char path[32];
-  alarmAudioPath(alarm.id, ".wav", path, sizeof(path));
   File audio = LittleFS.open(path, "r");
   if (!audio) {
-    Serial.println("Could not open alarm WAV file.");
+    Serial.printf("Could not open %s WAV file.\n", label);
     return false;
   }
 
   WavInfo wav = {};
   if (!readWavInfo(audio, wav)) {
     audio.close();
-    Serial.println("Alarm WAV must be PCM, 8/16-bit mono/stereo at 8-48 kHz.");
+    Serial.printf("%s WAV must be PCM, 8/16-bit mono/stereo at 8-48 kHz.\n", label);
     return false;
   }
   if (!audio.seek(wav.dataOffset) ||
       i2s_set_clk(I2S_NUM_0, wav.sampleRate, I2S_BITS_PER_SAMPLE_16BIT,
                   I2S_CHANNEL_MONO) != ESP_OK) {
     audio.close();
-    Serial.println("Could not prepare I2S for the alarm WAV sample rate.");
+    Serial.printf("Could not prepare I2S for the %s WAV sample rate.\n", label);
     return false;
   }
 
@@ -697,7 +1102,7 @@ bool playAlarmAudio(const Alarm &alarm) {
         mixedSample += sample;
       }
       mixedSample /= wav.channels;
-      output[i] = static_cast<int16_t>(mixedSample * alarm.volume / 100);
+      output[i] = static_cast<int16_t>(mixedSample * volume / 100);
     }
     size_t bytesWritten = 0;
     const size_t outputBytes = frameCount * sizeof(int16_t);
@@ -720,10 +1125,22 @@ bool playAlarmAudio(const Alarm &alarm) {
   audio.close();
   if (i2s_set_clk(I2S_NUM_0, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_16BIT,
                   I2S_CHANNEL_MONO) != ESP_OK) {
-    Serial.println("Could not restore the alarm audio sample rate.");
+    Serial.printf("Could not restore the %s audio sample rate.\n", label);
     success = false;
   }
   return success;
+}
+
+bool playAlarmAudio(const Alarm &alarm) {
+  char path[32];
+  alarmAudioPath(alarm.id, ".wav", path, sizeof(path));
+  return playStoredAudio(path, alarm.volume, "alarm");
+}
+
+bool playTimerAudio(const Timer &timer) {
+  char path[32];
+  timerAudioPath(timer.id, ".wav", path, sizeof(path));
+  return playStoredAudio(path, timer.volume, "timer");
 }
 
 bool persistAlarmStorage() {
@@ -731,9 +1148,26 @@ bool persistAlarmStorage() {
          sizeof(alarmStorage);
 }
 
+bool persistTimerStorage() {
+  return preferences.putBytes("timers", &timerStorage, sizeof(timerStorage)) ==
+         sizeof(timerStorage);
+}
+
 void alarmAudioPath(uint32_t id, const char *suffix, char *path,
                     size_t pathSize) {
   snprintf(path, pathSize, "/alarm_%lu%s", static_cast<unsigned long>(id), suffix);
+}
+
+void timerAudioPath(uint32_t id, const char *suffix, char *path,
+                    size_t pathSize) {
+  snprintf(path, pathSize, "/timer_%lu%s", static_cast<unsigned long>(id), suffix);
+}
+
+bool hasTimerAudio(uint32_t id) {
+  if (!fileSystemReady) return false;
+  char path[32];
+  timerAudioPath(id, ".wav", path, sizeof(path));
+  return LittleFS.exists(path);
 }
 
 bool hasAlarmAudio(uint32_t id) {
@@ -858,6 +1292,48 @@ bool loadAlarmStorage() {
   return true;
 }
 
+bool loadTimerStorage() {
+  const size_t storedSize = preferences.getBytesLength("timers");
+  if (storedSize == 0) {
+    timerStorage.version = 1;
+    timerStorage.count = 0;
+    timerStorage.nextId = 1;
+    return persistTimerStorage();
+  }
+  if (storedSize != sizeof(timerStorage)) {
+    Serial.println("Stored timers use an unsupported format.");
+    return false;
+  }
+  memset(&timerStorage, 0, sizeof(timerStorage));
+  if (preferences.getBytes("timers", &timerStorage, sizeof(timerStorage)) !=
+      storedSize) {
+    Serial.println("Could not read the stored timers.");
+    return false;
+  }
+  if (timerStorage.version != 1 || timerStorage.count > MAX_TIMERS ||
+      timerStorage.nextId == 0) {
+    Serial.println("Stored timers are invalid.");
+    return false;
+  }
+  for (uint8_t i = 0; i < timerStorage.count; ++i) {
+    Timer &timer = timerStorage.timers[i];
+    if (timer.durationSeconds == 0 ||
+        timer.durationSeconds > 24UL * 60 * 60 ||
+        timer.remainingSeconds > timer.durationSeconds ||
+        timer.volume < 1 || timer.volume > 100 ||
+        timer.running > 1) {
+      Serial.println("Stored timer data is invalid.");
+      return false;
+    }
+    timer.remainingSeconds = timer.remainingSeconds > 0
+                              ? timer.remainingSeconds
+                              : timer.durationSeconds;
+    timer.running = 1;
+    timer.deadlineMillis = millis() + timer.remainingSeconds * 1000UL;
+  }
+  return persistTimerStorage();
+}
+
 String escapeJson(const char *text) {
   String escaped;
   for (const char *p = text; *p; ++p) {
@@ -905,6 +1381,58 @@ void sendAlarmList() {
   server.send(200, "application/json", response);
 }
 
+int findTimerIndex(uint32_t id) {
+  for (uint8_t i = 0; i < timerStorage.count; ++i) {
+    if (timerStorage.timers[i].id == id) return i;
+  }
+  return -1;
+}
+
+uint32_t timerRemaining(const Timer &timer) {
+  if (!timer.running) return timer.remainingSeconds;
+  const uint32_t now = millis();
+  if ((int32_t)(timer.deadlineMillis - now) <= 0) return 0;
+  const uint32_t leftMillis = timer.deadlineMillis - now;
+  return (leftMillis + 999) / 1000;
+}
+
+String formatDuration(uint32_t seconds) {
+  char text[9];
+  snprintf(text, sizeof(text), "%02u:%02u:%02u",
+           seconds / 3600, (seconds / 60) % 60, seconds % 60);
+  return String(text);
+}
+
+void sendTimerList() {
+  String response = "{\"timers\":[";
+  for (uint8_t i = 0; i < timerStorage.count; ++i) {
+    if (i > 0) response += ',';
+    Timer &timer = timerStorage.timers[i];
+    if (timer.running) {
+      const uint32_t remaining = timerRemaining(timer);
+      if (remaining == 0) timer.remainingSeconds = 0;
+      else timer.remainingSeconds = remaining;
+    }
+    response += "{\"id\":";
+    response += String(static_cast<unsigned long>(timer.id));
+    response += ",\"name\":\"";
+    response += escapeJson(timer.name);
+    response += "\",\"duration\":\"";
+    response += formatDuration(timer.durationSeconds);
+    response += "\",\"remaining\":\"";
+    response += formatDuration(timer.remainingSeconds);
+    response += "\",\"volume\":";
+    response += String(timer.volume);
+    response += ",\"hasAudio\":";
+    response += hasTimerAudio(timer.id) ? "true" : "false";
+    response += ",\"running\":";
+    response += timer.running ? "true" : "false";
+    response += "}";
+  }
+  response += "]}";
+  server.send(200, "application/json", response);
+}
+
 bool parseAlarmTime(const String &value, uint32_t &secondsOfDay) {
   const bool hasSeconds = value.length() == 8;
   if ((value.length() != 5 && !hasSeconds) || value[2] != ':' ||
@@ -923,6 +1451,31 @@ bool parseAlarmTime(const String &value, uint32_t &secondsOfDay) {
   }
   secondsOfDay = hours * 3600UL + minutes * 60UL + seconds;
   return true;
+}
+
+bool parseTimerDuration(const String &value, uint32_t &durationSeconds) {
+  uint32_t hours;
+  uint32_t minutes;
+  uint32_t seconds;
+  if (value.length() == 8 && value[2] == ':' && value[5] == ':' &&
+      isDigit(value[0]) && isDigit(value[1]) && isDigit(value[3]) &&
+      isDigit(value[4]) && isDigit(value[6]) && isDigit(value[7])) {
+    hours = (value[0] - '0') * 10 + value[1] - '0';
+    minutes = (value[3] - '0') * 10 + value[4] - '0';
+    seconds = (value[6] - '0') * 10 + value[7] - '0';
+  } else if (value.length() == 5 && value[2] == ':' &&
+             isDigit(value[0]) && isDigit(value[1]) &&
+             isDigit(value[3]) && isDigit(value[4])) {
+    hours = 0;
+    minutes = (value[0] - '0') * 10 + value[1] - '0';
+    seconds = (value[3] - '0') * 10 + value[4] - '0';
+  } else {
+    return false;
+  }
+  if (hours > 24 || minutes > 59 || seconds > 59 ||
+      (hours == 24 && (minutes != 0 || seconds != 0))) return false;
+  durationSeconds = hours * 3600UL + minutes * 60UL + seconds;
+  return durationSeconds > 0;
 }
 
 bool parseAlarmId(const String &value, uint32_t &id) {
@@ -1115,6 +1668,189 @@ void deleteAlarmHandler() {
   server.send(200, "text/plain", "Alarm deleted.");
 }
 
+void getTimersHandler() {
+  if (!preferencesReady) {
+    server.send(503, "text/plain", "Timer storage is unavailable.");
+    return;
+  }
+  sendTimerList();
+}
+
+bool parseTimerInput(Timer &timer, String &error) {
+  String name = server.arg("name");
+  name.trim();
+  if (name.length() == 0 || name.length() >= sizeof(timer.name)) {
+    error = "Enter a name with 1 to 31 characters.";
+    return false;
+  }
+  for (size_t i = 0; i < name.length(); ++i) {
+    if (static_cast<uint8_t>(name[i]) < 0x20) {
+      error = "The timer name contains an invalid character.";
+      return false;
+    }
+  }
+  const String durationText = server.arg("duration");
+  uint32_t durationSeconds;
+  if (!parseTimerDuration(durationText, durationSeconds)) {
+    error = "Enter a valid timer duration.";
+    return false;
+  }
+  const String volumeText = server.arg("volume");
+  for (size_t i = 0; i < volumeText.length(); ++i) {
+    if (!isDigit(volumeText[i])) {
+      error = "Choose a timer volume from 1 to 100.";
+      return false;
+    }
+  }
+  const long volume = volumeText.toInt();
+  if (volumeText.length() == 0 || volume < 1 || volume > 100) {
+    error = "Choose a timer volume from 1 to 100.";
+    return false;
+  }
+  memset(&timer, 0, sizeof(timer));
+  memcpy(timer.name, name.c_str(), name.length());
+  timer.durationSeconds = durationSeconds;
+  timer.remainingSeconds = durationSeconds;
+  timer.volume = static_cast<uint8_t>(volume);
+  return true;
+}
+
+void createTimerHandler() {
+  if (!preferencesReady) {
+    server.send(503, "text/plain", "Timer storage is unavailable.");
+    return;
+  }
+  if (timerStorage.count >= MAX_TIMERS ||
+      timerStorage.nextId == UINT32_MAX) {
+    server.send(400, "text/plain", "Timer limit reached.");
+    return;
+  }
+  Timer timer;
+  String error;
+  if (!parseTimerInput(timer, error)) {
+    server.send(400, "text/plain", error);
+    return;
+  }
+  const TimerStorage previous = timerStorage;
+  timer.id = timerStorage.nextId++;
+  timer.running = 1;
+  timer.deadlineMillis = millis() + timer.durationSeconds * 1000UL;
+  timerStorage.timers[timerStorage.count++] = timer;
+  if (!persistTimerStorage()) {
+    timerStorage = previous;
+    server.send(500, "text/plain", "Could not save the timer.");
+    return;
+  }
+  const String response =
+      String("{\"id\":") + String(static_cast<unsigned long>(timer.id)) + "}";
+  server.send(201, "application/json", response);
+}
+
+void updateTimerHandler() {
+  if (!preferencesReady) {
+    server.send(503, "text/plain", "Timer storage is unavailable.");
+    return;
+  }
+  uint32_t id;
+  if (!parseAlarmId(server.arg("id"), id)) {
+    server.send(400, "text/plain", "Missing or invalid timer id.");
+    return;
+  }
+  const int index = findTimerIndex(id);
+  if (index < 0) {
+    server.send(404, "text/plain", "Timer not found.");
+    return;
+  }
+  const String action = server.arg("action");
+  Timer &timer = timerStorage.timers[index];
+  if (action.length() > 0) {
+    Timer previous = timer;
+    if (action == "start") {
+      if (!timer.running) {
+        if (timer.remainingSeconds == 0)
+          timer.remainingSeconds = timer.durationSeconds;
+        timer.deadlineMillis =
+            millis() + timer.remainingSeconds * 1000UL;
+        timer.running = 1;
+      }
+    } else if (action == "pause") {
+      if (timer.running) {
+        timer.remainingSeconds = timerRemaining(timer);
+        timer.running = 0;
+        timer.deadlineMillis = 0;
+      }
+    } else if (action == "reset") {
+      timer.remainingSeconds = timer.durationSeconds;
+      timer.running = 1;
+      timer.deadlineMillis = millis() + timer.durationSeconds * 1000UL;
+    } else {
+      server.send(400, "text/plain", "Invalid timer action.");
+      return;
+    }
+    if (!persistTimerStorage()) {
+      timer = previous;
+      server.send(500, "text/plain", "Could not update the timer.");
+      return;
+    }
+    server.send(200, "text/plain", "Timer updated.");
+    return;
+  }
+  Timer updated;
+  String error;
+  if (!parseTimerInput(updated, error)) {
+    server.send(400, "text/plain", error);
+    return;
+  }
+  updated.id = id;
+  const Timer previous = timer;
+  updated.running = 1;
+  updated.remainingSeconds = updated.durationSeconds;
+  updated.deadlineMillis = millis() + updated.durationSeconds * 1000UL;
+  timer = updated;
+  if (!persistTimerStorage()) {
+    timer = previous;
+    server.send(500, "text/plain", "Could not save the timer.");
+    return;
+  }
+  server.send(200, "text/plain", "Timer updated.");
+}
+
+void deleteTimerHandler() {
+  if (!preferencesReady) {
+    server.send(503, "text/plain", "Timer storage is unavailable.");
+    return;
+  }
+  uint32_t id;
+  if (!parseAlarmId(server.arg("id"), id)) {
+    server.send(400, "text/plain", "Missing or invalid timer id.");
+    return;
+  }
+  const int index = findTimerIndex(id);
+  if (index < 0) {
+    server.send(404, "text/plain", "Timer not found.");
+    return;
+  }
+  const TimerStorage previous = timerStorage;
+  for (uint8_t i = index; i + 1 < timerStorage.count; ++i)
+    timerStorage.timers[i] = timerStorage.timers[i + 1];
+  memset(&timerStorage.timers[timerStorage.count - 1], 0, sizeof(Timer));
+  --timerStorage.count;
+  if (!persistTimerStorage()) {
+    timerStorage = previous;
+    server.send(500, "text/plain", "Could not delete the timer.");
+    return;
+  }
+  if (fileSystemReady) {
+    const char *suffixes[] = {".wav", ".tmp", ".bak"};
+    for (const char *suffix : suffixes) {
+      char path[32];
+      timerAudioPath(id, suffix, path, sizeof(path));
+      if (LittleFS.exists(path)) LittleFS.remove(path);
+    }
+  }
+  server.send(200, "text/plain", "Timer deleted.");
+}
+
 void failAudioUpload(const String &message, int statusCode = 500) {
   audioUploadFailed = true;
   audioUploadComplete = false;
@@ -1123,8 +1859,10 @@ void failAudioUpload(const String &message, int statusCode = 500) {
   if (audioUploadFile) audioUploadFile.close();
   if (audioUploadId != 0) {
     char temporaryPath[32];
-    alarmAudioPath(audioUploadId, ".tmp", temporaryPath,
-                   sizeof(temporaryPath));
+    if (audioUploadIsTimer)
+      timerAudioPath(audioUploadId, ".tmp", temporaryPath, sizeof(temporaryPath));
+    else
+      alarmAudioPath(audioUploadId, ".tmp", temporaryPath, sizeof(temporaryPath));
     LittleFS.remove(temporaryPath);
   }
 }
@@ -1138,6 +1876,7 @@ void handleAudioUpload() {
     audioUploadError = "";
     audioUploadStatus = 500;
     audioUploadId = 0;
+    audioUploadIsTimer = server.arg("type") == "timer";
     audioUploadBytes = 0;
     if (!fileSystemReady) {
       failAudioUpload("Audio storage is unavailable.", 503);
@@ -1148,13 +1887,21 @@ void handleAudioUpload() {
       failAudioUpload("Missing or invalid alarm id.", 400);
       return;
     }
-    if (findAlarmIndex(id) < 0) {
+    if (audioUploadIsTimer) {
+      if (findTimerIndex(id) < 0) {
+        failAudioUpload("Timer not found.", 404);
+        return;
+      }
+    } else if (findAlarmIndex(id) < 0) {
       failAudioUpload("Alarm not found.", 404);
       return;
     }
     audioUploadId = id;
     char temporaryPath[32];
-    alarmAudioPath(id, ".tmp", temporaryPath, sizeof(temporaryPath));
+    if (audioUploadIsTimer)
+      timerAudioPath(id, ".tmp", temporaryPath, sizeof(temporaryPath));
+    else
+      alarmAudioPath(id, ".tmp", temporaryPath, sizeof(temporaryPath));
     LittleFS.remove(temporaryPath);
     audioUploadFile = LittleFS.open(temporaryPath, "w");
     if (!audioUploadFile) {
@@ -1191,9 +1938,15 @@ void handleAudioUpload() {
   char finalPath[32];
   char temporaryPath[32];
   char backupPath[32];
-  alarmAudioPath(audioUploadId, ".wav", finalPath, sizeof(finalPath));
-  alarmAudioPath(audioUploadId, ".tmp", temporaryPath, sizeof(temporaryPath));
-  alarmAudioPath(audioUploadId, ".bak", backupPath, sizeof(backupPath));
+  if (audioUploadIsTimer) {
+    timerAudioPath(audioUploadId, ".wav", finalPath, sizeof(finalPath));
+    timerAudioPath(audioUploadId, ".tmp", temporaryPath, sizeof(temporaryPath));
+    timerAudioPath(audioUploadId, ".bak", backupPath, sizeof(backupPath));
+  } else {
+    alarmAudioPath(audioUploadId, ".wav", finalPath, sizeof(finalPath));
+    alarmAudioPath(audioUploadId, ".tmp", temporaryPath, sizeof(temporaryPath));
+    alarmAudioPath(audioUploadId, ".bak", backupPath, sizeof(backupPath));
+  }
   File uploadedAudio = LittleFS.open(temporaryPath, "r");
   WavInfo wav = {};
   const bool validWav =
@@ -1239,8 +1992,29 @@ void finishAudioUpload() {
   audioUploadComplete = false;
   audioUploadFailed = false;
   audioUploadId = 0;
+  audioUploadIsTimer = false;
   audioUploadBytes = 0;
   audioUploadError = "";
+}
+
+void checkTimers() {
+  if (!preferencesReady || !audioReady) return;
+  for (uint8_t i = 0; i < timerStorage.count; ++i) {
+    Timer &timer = timerStorage.timers[i];
+    if (!timer.running) continue;
+    if (timerRemaining(timer) != 0) continue;
+    timer.running = 0;
+    timer.remainingSeconds = 0;
+    timer.deadlineMillis = 0;
+    persistTimerStorage();
+    Serial.printf("Timer '%s' is finished.\n", timer.name);
+    const bool played = hasTimerAudio(timer.id)
+                            ? playTimerAudio(timer)
+                            : playAlarmTone(timer.volume);
+    if (!played) {
+      Serial.println("Timer audio playback failed.");
+    }
+  }
 }
 
 void connectRoutes() {
@@ -1251,6 +2025,10 @@ void connectRoutes() {
   server.on("/api/alarms", HTTP_POST, createAlarmHandler);
   server.on("/api/alarms", HTTP_PUT, updateAlarmHandler);
   server.on("/api/alarms", HTTP_DELETE, deleteAlarmHandler);
+  server.on("/api/timers", HTTP_GET, getTimersHandler);
+  server.on("/api/timers", HTTP_POST, createTimerHandler);
+  server.on("/api/timers", HTTP_PUT, updateTimerHandler);
+  server.on("/api/timers", HTTP_DELETE, deleteTimerHandler);
   server.on("/api/audio", HTTP_POST, finishAudioUpload, handleAudioUpload);
   server.onNotFound([]() {
     server.send(404, "text/plain", "Not found.");
@@ -1304,6 +2082,9 @@ void setup() {
     lastFiredDay[i] = -1;
   }
   preferencesReady = loadAlarmStorage();
+  if (preferencesReady && !loadTimerStorage()) {
+    Serial.println("Timer storage initialization failed.");
+  }
   fileSystemReady = LittleFS.begin(false);
   if (!fileSystemReady) {
     Serial.println("LittleFS mount failed; formatting the audio partition.");
@@ -1418,4 +2199,5 @@ void loop() {
     }
   }
   checkAlarms();
+  checkTimers();
 }
