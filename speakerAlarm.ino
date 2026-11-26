@@ -13,8 +13,9 @@ constexpr gpio_num_t I2S_BCLK = GPIO_NUM_16;
 constexpr gpio_num_t I2S_DIN = GPIO_NUM_17;
 constexpr uint8_t AMP_SD = 18;
 
-const char *WIFI_SSID = "DEA";
-const char *WIFI_PASSWORD = "40542992";
+// Wi-Fi credentials live in secrets.h, which git ignores.
+// Copy secrets.example.h to secrets.h and fill in your network name and password.
+#include "secrets.h"
 
 constexpr uint32_t SAMPLE_RATE = 44100;
 constexpr uint16_t TONE_HZ = 440;
@@ -2126,6 +2127,9 @@ void setup() {
 
   connectRoutes();
   WiFi.mode(WIFI_STA);
+  // Keep the radio awake. With modem sleep on, the ESP32 misses ARP and mDNS
+  // broadcasts, so the page by IP or speakeralarm.local only loads intermittently.
+  WiFi.setSleep(false);
   WiFi.setHostname("speakeralarm");
   WiFi.onEvent(handleWiFiEvent);
   WiFi.setAutoReconnect(true);
